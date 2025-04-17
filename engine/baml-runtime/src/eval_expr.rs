@@ -283,6 +283,109 @@ async fn beta_reduce<'a>(
     }
 }
 
+pub async fn eval_to_value_or_llm_call<'a>(
+    env: &EvalEnv<'a>,
+    expr: &Expr<ExprMetadata>,
+) -> anyhow::Result<ExprEvalResult> {
+    let mut current_expr = expr.clone();
+
+    for steps in 0..MAX_STEPS {
+        match current_expr {
+            Expr::App(f, args, meta) => match (f.as_ref(), args.as_ref()) {
+                (Expr::LLMFunction(name, arg_names, _), Expr::ArgsTuple(args, _)) => {
+                    let mut evaluated_args: Vec<(String, BamlValue)> = Vec::new();
+                    for (arg_name, arg) in arg_names.into_iter().zip(args) {
+                        let val = eval_to_value(env, arg).await;
+                        evaluated_args
+                            .push((arg_name.clone(), val.unwrap().unwrap().clone().value()));
+                    }
+                    return Ok(ExprEvalResult::LLMCall {
+                        name: name.clone(),
+                        args: BamlMap::from_iter(evaluated_args.into_iter()),
+                    });
+                }
+                _ => {
+                    todo!()
+                }
+            },
+            Expr::Atom(value) => return Ok(ExprEvalResult::Value(value.clone().map_meta(|_| ()))),
+            Expr::List(items, meta) => {
+                let mut new_items = Vec::new();
+                for item in items {
+                    let val = Box::pin(eval_to_value(env, &item))
+                        .await?
+                        .context("Evaluated value to None")?;
+                    new_items.push(val);
+                }
+                let val = BamlValueWithMeta::List(new_items, ());
+                return Ok(ExprEvalResult::Value(val));
+            }
+            Expr::Map(items, meta) => {
+                let mut new_items = BamlMap::new();
+                for (key, value) in items {
+                    let val = Box::pin(eval_to_value(env, &value))
+                        .await?
+                        .context("Evaluated value to None")?;
+                    new_items.insert(key.clone(), val);
+                }
+                let val = BamlValueWithMeta::Map(new_items, ());
+                return Ok(ExprEvalResult::Value(val));
+            }
+            Expr::ClassConstructor {
+                name,
+                fields,
+                spread,
+                meta,
+            } => {
+                let mut new_fields = BamlMap::new();
+                for (key, value) in fields {
+                    let val = Box::pin(eval_to_value(env, &value))
+                        .await?
+                        .context("Evaluated value to None")?;
+                    new_fields.insert(key.clone(), val);
+                }
+                let mut spread_fields = match spread {
+                    Some(spread) => {
+                        let res = Box::pin(eval_to_value(env, spread.as_ref())).await?;
+                        match res {
+                            Some(BamlValueWithMeta::Class(spread_class_name, spread_fields, _)) => {
+                                if name != spread_class_name {
+                                    return Err(anyhow::anyhow!("Class constructor name mismatch"));
+                                }
+                                spread_fields.clone()
+                            }
+                            _ => {
+                                return Err(anyhow::anyhow!("Spread is not a class"));
+                            }
+                        }
+                    }
+                    None => BamlMap::new(),
+                };
+                spread_fields.extend(new_fields);
+                let val = BamlValueWithMeta::Class(name.clone(), spread_fields, ());
+                return Ok(ExprEvalResult::Value(val));
+            }
+            other => {
+                let new_expr = Box::pin(beta_reduce(env, &other)).await?;
+                if new_expr.temporary_same_state(expr) {
+                    return Err(anyhow::anyhow!("Failed to make progress"));
+                }
+                current_expr = new_expr;
+            }
+        }
+    }
+    Err(anyhow::anyhow!("Max steps reached."))
+}
+
+#[derive(Clone, Debug)]
+pub enum ExprEvalResult {
+    Value(BamlValueWithMeta<()>),
+    LLMCall {
+        name: String,
+        args: BamlMap<String, BamlValue>,
+    },
+}
+
 /// Fully evaluate an expression to a value.
 pub async fn eval_to_value<'a>(
     env: &EvalEnv<'a>,
