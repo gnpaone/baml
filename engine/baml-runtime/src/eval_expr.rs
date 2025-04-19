@@ -220,6 +220,7 @@ async fn beta_reduce<'a>(
                     // if let Some(tx) = &env.expr_tx {
                     //     tx.unbounded_send(vec![]).unwrap();
                     // }
+                    panic!("HERE2");
                     let res: anyhow::Result<FunctionResult> = env
                         .runtime
                         .call_function(name.clone(), &args_map, &ctx, None, None, None)
@@ -279,6 +280,15 @@ async fn beta_reduce<'a>(
         Expr::List(_, _) => Ok(expr.clone()),
         Expr::Map(_, _) => Ok(expr.clone()),
         Expr::ClassConstructor { .. } => Ok(expr.clone()),
+        Expr::ArgsTuple(_, _) => Ok(expr.clone()),
+
+        Expr::Lambda(arity, body, meta) => {
+            if *arity == 0 {
+                Ok(body.as_ref().clone())
+            } else {
+                Ok(expr.clone())
+            }
+        }
         _ => Err(anyhow::anyhow!("Not an application: {:?}", expr)),
     }
 }
@@ -289,23 +299,49 @@ pub async fn eval_to_value_or_llm_call<'a>(
 ) -> anyhow::Result<ExprEvalResult> {
     let mut current_expr = expr.clone();
 
+    eprintln!("start eval_to_value_or_llm_call:\n{:?}", expr);
     for steps in 0..MAX_STEPS {
         match current_expr {
             Expr::App(f, args, meta) => match (f.as_ref(), args.as_ref()) {
+                (Expr::FreeVar(name, _), _) => match env.context.get(name) {
+                    Some(expr) => {
+                        current_expr =
+                            Expr::App(Arc::new(expr.clone()), args.clone(), meta.clone());
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!("Variable not found: {:?}", name));
+                    }
+                },
+                (f, Expr::FreeVar(name, _)) => match env.context.get(name) {
+                    Some(expr) => {
+                        current_expr =
+                            Expr::App(Arc::new(f.clone()), Arc::new(expr.clone()), meta.clone());
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!("Variable not found: {:?}", name));
+                    }
+                },
                 (Expr::LLMFunction(name, arg_names, _), Expr::ArgsTuple(args, _)) => {
+                    panic!("HERE");
                     let mut evaluated_args: Vec<(String, BamlValue)> = Vec::new();
                     for (arg_name, arg) in arg_names.into_iter().zip(args) {
                         let val = eval_to_value(env, arg).await;
                         evaluated_args
                             .push((arg_name.clone(), val.unwrap().unwrap().clone().value()));
                     }
-                    return Ok(ExprEvalResult::LLMCall {
+                    let res = ExprEvalResult::LLMCall {
                         name: name.clone(),
                         args: BamlMap::from_iter(evaluated_args.into_iter()),
-                    });
+                    };
+                    eprintln!("eval_to_value_or_llm_call:\n{:?}\n{:?}", expr, res);
+                    return Ok(res);
                 }
                 _ => {
-                    todo!()
+                    let f_evaled = Box::pin(beta_reduce(env, &f)).await?;
+                    let args_evaled = Box::pin(beta_reduce(env, &args)).await?;
+                    let new_expr =
+                        Expr::App(Arc::new(f_evaled), Arc::new(args_evaled), meta.clone());
+                    current_expr = new_expr;
                 }
             },
             Expr::Atom(value) => return Ok(ExprEvalResult::Value(value.clone().map_meta(|_| ()))),
@@ -374,7 +410,7 @@ pub async fn eval_to_value_or_llm_call<'a>(
             }
         }
     }
-    Err(anyhow::anyhow!("Max steps reached."))
+    Err(anyhow::anyhow!("Max steps reached. {:?}", current_expr))
 }
 
 #[derive(Clone, Debug)]
@@ -489,7 +525,7 @@ mod tests {
         .unwrap()
     }
 
-    // #[tokio::test] // Uncomment to run.
+    #[tokio::test] // Uncomment to run.
     async fn test_eval_expr() {
         let rt = runtime(
             r##"
@@ -593,6 +629,20 @@ test TestMakePerson() {
   functions [MakePerson]
   args { }
 }
+
+function Echo(msg: string) -> string {
+    client GPT4o
+    prompt #"Please repeat the message back to me, with three words of elaboration and a twist: {{ msg }}"#
+  }
+  
+  fn Go() -> string {
+    Echo("Hello")
+  }
+  
+  test Go {
+    functions [Go]
+    args {}
+  }
         "##,
         );
         // dbg!(&rt.inner.ir.find_function("OuterPyramid").unwrap().item);
@@ -605,7 +655,7 @@ test TestMakePerson() {
         dbg!(&f.item);
         let (res, _) = rt
             // .run_test("Second", "TestSecond", &ctx, Some(on_event))
-            .run_test("OuterPyramid", "OuterPyramid", &ctx, Some(on_event), None)
+            .run_test("Go", "Go", &ctx, Some(on_event), None)
             // .run_test("MakePerson", "TestMakePerson", &ctx, Some(on_event), None)
             // .run_test("CompareHaikus", "Test", &ctx, Some(on_event))
             // .run_test("LlmParseInt", "TestParse", &ctx, Some(on_event))

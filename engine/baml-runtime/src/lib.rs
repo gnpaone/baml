@@ -545,18 +545,7 @@ impl BamlRuntime {
                             .await
                     }
                     Some(expr_fn) => {
-                        // TODO: This code path is ugly. Calling a function heavily assumes that the
-                        // function is an LLM function. Find a way to make function-calling API more
-                        // hospitable to Expression Fns, or create new APIs for calling Expr Fns.
-                        let expr_fn = &self
-                            .inner
-                            .ir()
-                            .expr_fns
-                            .iter()
-                            .find(|f| f.elem.name == function_name)
-                            .expect("We checked earlier that this function is an expr_fn")
-                            .elem;
-                        let fn_expr = expr_fn.expr.clone();
+                        let fn_expr = expr_fn.elem.expr.clone();
                         let context = initial_context(&self.inner.ir());
                         let env = EvalEnv {
                             context,
@@ -599,49 +588,92 @@ impl BamlRuntime {
 
                         let params_expr: Expr<ExprMetadata> =
                             Expr::ArgsTuple(param_baml_values, (fake_syntax_span.clone(), None));
-                        let result_type = expr_fn.output.clone();
+                        let result_type = expr_fn.elem.output.clone();
                         let fn_call_expr = Expr::App(
                             Arc::new(fn_expr),
                             Arc::new(params_expr),
                             (fake_syntax_span.clone(), Some(result_type.clone())),
                         );
-                        let res = eval_expr::eval_to_value(&env, &fn_call_expr)
-                            .await
-                            .map(|v| {
-                                v.map(|v| {
-                                    ResponseBamlValue(v.map_meta(|_| {
-                                        ResponseValueMeta(
-                                            vec![],
-                                            vec![],
-                                            Completion::default(),
-                                            result_type.clone(),
-                                        )
-                                    }))
-                                })
-                            })
-                            .transpose();
+                        let res = eval_expr::eval_to_value_or_llm_call(&env, &fn_call_expr).await;
+                        match res {
+                            Ok(eval_expr::ExprEvalResult::Value(v)) => {
+                                let llm_response = LLMResponse::Success(LLMCompleteResponse {
+                                    client: "openai".to_string(),
+                                    model: "gpt-3.5-turbo".to_string(),
+                                    prompt: RenderedPrompt::Completion(
+                                        "Sample raw response".to_string(),
+                                    ),
+                                    request_options: BamlMap::new(),
+                                    content: "Sample raw response".to_string(),
+                                    start_time: SystemTime::now(),
+                                    latency: Duration::from_millis(2025),
+                                    metadata: LLMCompleteResponseMetadata {
+                                        baml_is_complete: true,
+                                        finish_reason: Some("stop".to_string()),
+                                        prompt_tokens: Some(50),
+                                        output_tokens: Some(50),
+                                        total_tokens: Some(100),
+                                    },
+                                });
+                                let response_baml_value = ResponseBamlValue(v.map_meta(|_| {
+                                    ResponseValueMeta(
+                                        vec![],
+                                        vec![],
+                                        Completion::default(),
+                                        result_type.clone(),
+                                    )
+                                }));
+                                Ok(FunctionResult::new(
+                                    OrchestrationScope { scope: vec![] },
+                                    llm_response,
+                                    Some(Ok(response_baml_value)),
+                                ))
+                            }
+                            Ok(eval_expr::ExprEvalResult::LLMCall { name, args }) => {
+                                self.inner
+                                    .call_function_impl(function_name, params, rctx)
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        }
 
-                        let llm_response = LLMResponse::Success(LLMCompleteResponse {
-                            client: "openai".to_string(),
-                            model: "gpt-3.5-turbo".to_string(),
-                            prompt: RenderedPrompt::Completion("Sample raw response".to_string()),
-                            request_options: BamlMap::new(),
-                            content: "Sample raw response".to_string(),
-                            start_time: SystemTime::now(),
-                            latency: Duration::from_millis(2025),
-                            metadata: LLMCompleteResponseMetadata {
-                                baml_is_complete: true,
-                                finish_reason: Some("stop".to_string()),
-                                prompt_tokens: Some(50),
-                                output_tokens: Some(50),
-                                total_tokens: Some(100),
-                            },
-                        });
-                        Ok(FunctionResult::new(
-                            OrchestrationScope { scope: vec![] },
-                            llm_response,
-                            res,
-                        ))
+                        // let res = eval_expr::eval_to_value(&env, &fn_call_expr)
+                        //     .await
+                        //     .map(|v| {
+                        //         v.map(|v| {
+                        //             ResponseBamlValue(v.map_meta(|_| {
+                        //                 ResponseValueMeta(
+                        //                     vec![],
+                        //                     vec![],
+                        //                     Completion::default(),
+                        //                     result_type.clone(),
+                        //                 )
+                        //             }))
+                        //         })
+                        //     })
+                        //     .transpose();
+
+                        // let llm_response = LLMResponse::Success(LLMCompleteResponse {
+                        //     client: "openai".to_string(),
+                        //     model: "gpt-3.5-turbo".to_string(),
+                        //     prompt: RenderedPrompt::Completion("Sample raw response".to_string()),
+                        //     request_options: BamlMap::new(),
+                        //     content: "Sample raw response".to_string(),
+                        //     start_time: SystemTime::now(),
+                        //     latency: Duration::from_millis(2025),
+                        //     metadata: LLMCompleteResponseMetadata {
+                        //         baml_is_complete: true,
+                        //         finish_reason: Some("stop".to_string()),
+                        //         prompt_tokens: Some(50),
+                        //         output_tokens: Some(50),
+                        //         total_tokens: Some(100),
+                        //     },
+                        // });
+                        // Ok(FunctionResult::new(
+                        //     OrchestrationScope { scope: vec![] },
+                        //     llm_response,
+                        //     res,
+                        // ))
                     }
                 }
             }
